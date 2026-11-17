@@ -1,8 +1,10 @@
 ﻿# nidaqmx-rs
 
 Synchronous NI-DAQmx device enumeration and multi-channel analog voltage input.
-The raw C bindings are generated from `ext/include/NIDAQmx.h` using bindgen.
-The current build links the bundled Windows x64 import library; an installed
+The raw C bindings are generated using bindgen from the installed header at
+`C:\Program Files (x86)\National Instruments\Shared\ExternalCompilerSupport\C\include\NIDAQmx.h`.
+The current build links the installed Windows x64 import library in
+`C:\Program Files (x86)\National Instruments\Shared\ExternalCompilerSupport\C\lib64\msvc`; an installed
 NI-DAQmx runtime is required to run applications and tests. Building requires
 Rust, MSVC build tools, and libclang for bindgen.
 

@@ -4,11 +4,12 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Tell cargo to look for shared libraries in the specified directory
-    println!("cargo:rustc-link-search=ext/lib64/msvc");
+    // Link against the installed NI-DAQmx Windows x64 import library.
+    println!(
+        r"cargo:rustc-link-search=native=C:\Program Files (x86)\National Instruments\Shared\ExternalCompilerSupport\C\lib64\msvc"
+    );
 
-    // Tell cargo to tell rustc to link the system bzip2
-    // shared library.
+    // Link the NI-DAQmx driver.
     println!("cargo:rustc-link-lib=NIDAQmx");
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
@@ -22,7 +23,7 @@ fn main() {
         // bindings for.
         .header("wrapper.h")
         // Tell clang where to find NIDAQmx.h
-        .clang_arg("-Iext/include")
+        .clang_arg(r"-IC:\Program Files (x86)\National Instruments\Shared\ExternalCompilerSupport\C\include")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
