@@ -1,188 +1,320 @@
-#![allow(dead_code)]
-
+//! Synchronous NI-DAQmx analog voltage acquisition.
 mod nidaqmx_sys;
 
-use std::cmp::Ordering;
-use std::ffi::CString;
-use std::mem;
+use nidaqmx_sys as sys;
+use std::{ffi::CString, fmt, ptr, rc::Rc};
 
-use nidaqmx_sys::TaskHandle;
-use nidaqmx_sys::int32;
-        
-// todo: How to handle warnings?
+/// An NI-DAQmx error, or invalid input (code 0).
 #[derive(Debug)]
-struct Error {
-    code: i32,
-    description: String,
-    extended_info: String
+pub struct Error {
+    pub code: i32,
+    pub description: String,
+    pub extended_info: String,
 }
 
-struct Task {
-    handle: TaskHandle,
-    ai_channels: AIChannelCollection
-}
-
-struct AIChannel {
-    task_handle: TaskHandle,
-    name: String
-}
-
-struct AIChannelCollection {
-    task_handle: TaskHandle
-}
-
-impl Task {
-    fn new(name: &str) -> Result<Task, Error> {
-        // todo: propagate this error, too.
-        let name_cstr = CString::new(name).unwrap();
-        let mut task: TaskHandle;
-        let ret_code: int32;
-        unsafe {
-            task = mem::zeroed();
-            ret_code = nidaqmx_sys::DAQmxCreateTask(name_cstr.as_ptr(), &mut task);
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NI-DAQmx ({}): {}", self.code, self.description)?;
+        if !self.extended_info.is_empty() {
+            write!(f, ": {}", self.extended_info)?;
         }
-        // todo: nidaqmx_sys::DAQmxSuccess has the wrong type.
-        match ret_code.cmp(&0) {
-            Ordering::Less =>
-                Err(Error {
-                        code: ret_code,
-                        // todo: handle these
-                        description: String::new(),
-                        extended_info: String::new()
-                    }
-                ),
-            _ => Ok(Task {
-                        handle: task,
-                        ai_channels: AIChannelCollection{task_handle: task}
-                    }
-                )
+
+        Ok(())
+    }
+}
+
+impl std::error::Error for Error {}
+
+fn invalid(message: &str) -> Error {
+    Error {
+        code: 0,
+        description: message.into(),
+        extended_info: String::new(),
+    }
+}
+
+fn cstring(value: &str) -> Result<CString, Error> {
+    CString::new(value).map_err(|_| invalid("String contains an interior NUL byte"))
+}
+
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes.split(|&b| b == 0).next().unwrap_or_default()).into_owned()
+}
+
+fn check(code: i32) -> Result<(), Error> {
+    if code >= 0 {
+        return Ok(());
+    }
+
+    // Capture extended information before another DAQmx call can replace it.
+    let mut extended = vec![0u8; 65536];
+    let mut description = vec![0u8; 65536];
+    unsafe {
+        sys::DAQmxGetExtendedErrorInfo(extended.as_mut_ptr().cast(), extended.len() as u32);
+        sys::DAQmxGetErrorString(
+            code,
+            description.as_mut_ptr().cast(),
+            description.len() as u32,
+        );
+    }
+
+    Err(Error {
+        code,
+        description: decode(&description),
+        extended_info: decode(&extended),
+    })
+}
+
+// DAQmx string getters return the required buffer size for a zero-sized query.
+fn get_string(mut get: impl FnMut(*mut std::os::raw::c_char, u32) -> i32) -> Result<String, Error> {
+    loop {
+        let size = get(ptr::null_mut(), 0);
+        check(size)?;
+        if size == 0 {
+            return Ok(String::new());
+        }
+
+        let mut bytes = vec![0u8; size as usize];
+        let code = get(bytes.as_mut_ptr().cast(), size as u32);
+        if code == sys::DAQmxErrorBufferTooSmallForString
+            || code == sys::DAQmxWarningCAPIStringTruncatedToFitBuffer as i32
+        {
+            continue;
+        }
+        check(code)?;
+
+        return Ok(decode(&bytes));
+    }
+}
+
+fn names(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Enumerate installed DAQ devices. No devices is an empty list.
+pub fn get_system_devices() -> Result<Vec<String>, Error> {
+    get_string(|buf, size| unsafe { sys::DAQmxGetSysDevNames(buf, size) }).map(|s| names(&s))
+}
+
+struct TaskHandle(sys::TaskHandle);
+
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        // Clear also stops a running task. Destructors cannot report driver errors.
+        unsafe {
+            sys::DAQmxClearTask(self.0);
         }
     }
 }
 
-impl Drop for Task {
-    fn drop(&mut self) {
-        // todo: ignore ret code?
-        unsafe {
-            nidaqmx_sys::DAQmxClearTask(self.handle);
-            self.handle = mem::zeroed();
+/// A task and its configuration. Create and use it on the acquisition thread.
+/// Dropping the last task/channel/configuration owner stops and clears the task.
+pub struct Task {
+    handle: Rc<TaskHandle>,
+    pub ai_channels: AIChannelCollection,
+    pub timing: Timing,
+}
+
+pub struct AIChannelCollection {
+    handle: Rc<TaskHandle>,
+}
+
+pub struct AIChannel {
+    _handle: Rc<TaskHandle>,
+    pub name: String,
+}
+
+pub struct Timing {
+    handle: Rc<TaskHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleMode {
+    FiniteSamps,
+    ContinuousSamps,
+}
+
+impl Task {
+    pub fn new(name: &str) -> Result<Self, Error> {
+        let name = cstring(name)?;
+        let mut raw = ptr::null_mut();
+        check(unsafe { sys::DAQmxCreateTask(name.as_ptr(), &mut raw) })?;
+
+        let handle = Rc::new(TaskHandle(raw));
+
+        Ok(Self {
+            ai_channels: AIChannelCollection {
+                handle: handle.clone(),
+            },
+            timing: Timing {
+                handle: handle.clone(),
+            },
+            handle,
+        })
+    }
+
+    pub fn start(&self) -> Result<(), Error> {
+        check(unsafe { sys::DAQmxStartTask(self.handle.0) })
+    }
+
+    pub fn stop(&self) -> Result<(), Error> {
+        check(unsafe { sys::DAQmxStopTask(self.handle.0) })
+    }
+
+    /// Read samples per channel with a 10 second timeout, grouped by channel in
+    /// registration order. Returns only samples actually read; driver errors
+    /// (including timeouts) are returned even if the driver read partial data.
+    /// A zero request returns an empty vector; negative requests are rejected.
+    pub fn read_sync(&self, samples: i32) -> Result<Vec<f64>, Error> {
+        if samples < 0 {
+            return Err(invalid("Sample count must be nonnegative"));
         }
+        if samples == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut channels = 0;
+        check(unsafe { sys::DAQmxGetTaskNumChans(self.handle.0, &mut channels) })?;
+        if channels == 0 {
+            return Err(invalid("Task has no channels"));
+        }
+
+        let len = (samples as usize)
+            .checked_mul(channels as usize)
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or_else(|| invalid("Read buffer is too large"))?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| invalid("Cannot allocate read buffer"))?;
+        data.resize(len, 0.0);
+
+        let mut read = 0;
+        check(unsafe {
+            sys::DAQmxReadAnalogF64(
+                self.handle.0,
+                samples,
+                10.0,
+                sys::DAQmx_Val_GroupByChannel,
+                data.as_mut_ptr(),
+                len as u32,
+                &mut read,
+                ptr::null_mut(),
+            )
+        })?;
+
+        compact_samples(data, channels as usize, samples as usize, read)
+    }
+}
+
+// GroupByChannel uses the requested buffer width for each channel, as in NI's
+// nidaqmx-python Task.read. Remove unused tails from each channel separately.
+fn compact_samples(
+    mut data: Vec<f64>,
+    channels: usize,
+    requested: usize,
+    read: i32,
+) -> Result<Vec<f64>, Error> {
+    if read < 0 || read as usize > requested {
+        return Err(invalid("Driver returned an invalid sample count"));
+    }
+
+    let read = read as usize;
+    if read < requested {
+        for channel in 1..channels {
+            data.copy_within(
+                channel * requested..channel * requested + read,
+                channel * read,
+            );
+        }
+    }
+
+    data.truncate(read * channels);
+    Ok(data)
+}
+
+impl Timing {
+    /// Configure the internal sample clock on rising edges. In continuous mode,
+    /// samples_per_channel determines the driver's buffer sizing.
+    pub fn cfg_samp_clk_timing(
+        &self,
+        rate: f64,
+        mode: SampleMode,
+        samples_per_channel: u64,
+    ) -> Result<(), Error> {
+        if !rate.is_finite() || rate <= 0.0 || samples_per_channel == 0 {
+            return Err(invalid(
+                "Rate must be positive and finite, and sample count must be positive",
+            ));
+        }
+
+        let mode = match mode {
+            SampleMode::FiniteSamps => sys::DAQmx_Val_FiniteSamps,
+            SampleMode::ContinuousSamps => sys::DAQmx_Val_ContSamps,
+        };
+
+        check(unsafe {
+            sys::DAQmxCfgSampClkTiming(
+                self.handle.0,
+                c"".as_ptr(),
+                rate,
+                sys::DAQmx_Val_Rising as i32,
+                mode as i32,
+                samples_per_channel,
+            )
+        })
     }
 }
 
 impl AIChannelCollection {
-    fn add_ai_voltage_chan(
+    /// Add voltage input(s) using the device's default terminal configuration.
+    pub fn add_ai_voltage_chan(
         &self,
         physical_channel: &str,
         min_val: f64,
-        max_val: f64) -> Result<AIChannel, Error> {
-        // todo: propagate this error, too.
-        let phys_name_cstr = CString::new(physical_channel).unwrap();
-        // todo: this should be parameterized, but then the AIChannel name has to match this if non-empty.
-        let virt_name_cstr = CString::new("").unwrap();
-        // todo: scale name is useless without units
-        let scale_name_cstr = CString::new("").unwrap();
-        let ret_code: int32;
-        unsafe {
-            ret_code = nidaqmx_sys::DAQmxCreateAIVoltageChan(
-                self.task_handle,
-                phys_name_cstr.as_ptr(),
-                virt_name_cstr.as_ptr(),
-                nidaqmx_sys::DAQmx_Val_Default,
+        max_val: f64,
+    ) -> Result<AIChannel, Error> {
+        let physical = cstring(physical_channel)?;
+        check(unsafe {
+            sys::DAQmxCreateAIVoltageChan(
+                self.handle.0,
+                physical.as_ptr(),
+                c"".as_ptr(),
+                sys::DAQmx_Val_Default,
                 min_val,
                 max_val,
-                // todo: first-class enums
-                nidaqmx_sys::DAQmx_Val_Volts.try_into().unwrap(),
-                scale_name_cstr.as_ptr()
-            );
-        }
-        // todo: nidaqmx_sys::DAQmxSuccess has the wrong type.
-        match ret_code.cmp(&0) {
-            Ordering::Less =>
-                Err(Error {
-                        code: ret_code,
-                        // todo: handle these
-                        description: String::new(),
-                        extended_info: String::new()
-                    }
-                ),
-            _ => Ok(AIChannel {
-                        task_handle: self.task_handle,
-                        name: physical_channel.to_string()
-                    }
-                )
-        }
+                sys::DAQmx_Val_Volts as i32,
+                ptr::null(),
+            )
+        })?;
+
+        Ok(AIChannel {
+            _handle: self.handle.clone(),
+            name: physical_channel.into(),
+        })
     }
 
-    fn channel_names(&self) -> Result<Vec<String>, Error> {
-        let mut buf_size: usize = 0;
-        let channel_names: String;
-
-        let mut ret_code: int32;
-        loop {
-            let mut bytes: Vec<u8> = Vec::new();
-            bytes.resize(buf_size, 10 /* newline */);
-            let mut c_string: CString;
-
-            // todo: handle error
-            c_string = CString::new(bytes).unwrap();
-            let raw_c_string = c_string.into_raw();
-            unsafe {
-                ret_code = nidaqmx_sys::DAQmxGetTaskChannels(
-                    self.task_handle,
-                    raw_c_string,
-                    buf_size.try_into().unwrap(),
-                );
-                c_string = CString::from_raw(raw_c_string);
-            }
-            if (ret_code == nidaqmx_sys::DAQmxErrorBufferTooSmallForString) || (ret_code == nidaqmx_sys::DAQmxWarningCAPIStringTruncatedToFitBuffer.try_into().unwrap()) {
-                buf_size = 0;
-            } else if (ret_code > 0) && (buf_size == 0) {
-                buf_size = ret_code.try_into().unwrap();
-            } else {
-                // todo: handle_error
-                channel_names = c_string.into_string().unwrap();
-                break;
-            }
-        }
-        match ret_code.cmp(&0) {
-            Ordering::Less =>
-                Err(Error {
-                        code: ret_code,
-                        // todo: handle these
-                        description: String::new(),
-                        extended_info: String::new()
-                    }
-                ),
-            _ => Ok(unflatten_channel_string(&channel_names))
-        }
+    pub fn channel_names(&self) -> Result<Vec<String>, Error> {
+        get_string(|buf, size| unsafe { sys::DAQmxGetTaskChannels(self.handle.0, buf, size) })
+            .map(|s| names(&s))
     }
 
-    // We can't implement the Index trait because that requires returning references, but we make
-    // objects on-demand. this allows for random sets of channel to be referenced collectively at
-    // run-time.
-    fn channel_at(&self, index: usize) -> Result<AIChannel, Error> {
-        match self.channel_names() {
-            Ok(names) => Ok(AIChannel{task_handle: self.task_handle, name: names[index].clone()}),
-            Err(err) => Err(err)
-        }
+    pub fn channel_at(&self, index: usize) -> Result<AIChannel, Error> {
+        let name = self
+            .channel_names()?
+            .get(index)
+            .cloned()
+            .ok_or_else(|| invalid("Channel index out of bounds"))?;
+
+        Ok(AIChannel {
+            _handle: self.handle.clone(),
+            name,
+        })
     }
-
-    /* todo:
-    use std::ops::Range;
-    fn channel_at(&self, index: Range<usize>) -> Result<AIChannel, Error> {}
-    fn channel_at(&self, index: RangeFrom<usize>) -> Result<AIChannel, Error> {}
-    fn channel_at(&self, index: RangeFull<usize>) -> Result<AIChannel, Error> {}
-    fn channel_at(&self, index: RangeInclusive<usize>) -> Result<AIChannel, Error> {}
-    fn channel_at(&self, index: RangeTo<usize>) -> Result<AIChannel, Error> {}
-    fn channel_at(&self, index: RangeToInclusive<usize>) -> Result<AIChannel, Error> {}
-    */
-}
-
-// todo: move to utils submodule
-fn unflatten_channel_string(channel_names: &str) -> Vec<String> {
-    // todo: this isn't the full impl, gotta handle colons, etc.
-    channel_names.split(",").map(|s| s.trim().to_string()).collect()
 }
 
 #[cfg(test)]
@@ -190,90 +322,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_unflatten_channel_string() {
-        let chans = "Dev1/ai0, Dev1/ai1";
-        let chans_unflat = unflatten_channel_string(chans);
-        assert_eq!(chans_unflat.len(), 2);
-        assert_eq!(chans_unflat[0], "Dev1/ai0");
-        assert_eq!(chans_unflat[1], "Dev1/ai1");
+    fn parses_empty_and_ordered_names() {
+        assert!(names("").is_empty());
+        assert_eq!(
+            names("Dev1/ai0, Dev1/ai1, Dev1/ai2"),
+            ["Dev1/ai0", "Dev1/ai1", "Dev1/ai2"]
+        );
     }
 
     #[test]
-    fn create_close_task() {
-        let task_name = "create_close_task";
-        {
-            let _task = Task::new(task_name).unwrap();
-            let err = match Task::new(task_name) {
-                Ok(_) => panic!("duplicate task should error"),
-                Err(err) => err,
-            };
-            assert_eq!(err.code, nidaqmx_sys::DAQmxErrorDuplicateTask);
-        }
-        // original task should be dropped, so we can reuse the name.
-        {
-            if let Err(_) = Task::new(task_name) {
-                panic!("Task name should be available");
-            }
-        }
+    fn partial_and_empty_reads_preserve_channel_layout() {
+        assert_eq!(
+            compact_samples(vec![1., 2., 0., 10., 20., 0., 100., 200., 0.], 3, 3, 2).unwrap(),
+            [1., 2., 10., 20., 100., 200.]
+        );
+        assert!(compact_samples(vec![0.; 9], 3, 3, 0).unwrap().is_empty());
+        assert!(compact_samples(vec![0.; 9], 3, 3, 4).is_err());
+        assert!(compact_samples(vec![0.; 9], 3, 3, -1).is_err());
     }
 
     #[test]
-    fn create_ai_chan() {
-        let task_name = "create_ai_chan";
-        {
-            let task = Task::new(task_name).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai0", -5.0, 5.0).unwrap();
-            let err = match task.ai_channels.add_ai_voltage_chan("Dev1/ai0", -5.0, 5.0) {
-                Ok(_) => panic!("duplicate virtual channel name should error"),
-                Err(err) => err,
-            };
-            assert_eq!(err.code, nidaqmx_sys::DAQmxErrorChanAlreadyInTask);
-        }
+    fn nul_input_is_a_displayable_error() {
+        let error = Task::new("bad\0name").err().unwrap();
+        assert!(error.to_string().contains("NUL"));
     }
 
     #[test]
-    fn ai_channel_names() {
-        let task_name = "ai_channel_names";
-        {
-            let task = Task::new(task_name).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai0", -5.0, 5.0).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai1", -5.0, 5.0).unwrap();
-
-            let channel_names = task.ai_channels.channel_names().unwrap();
-            assert_eq!(channel_names.len(), 2);
-            assert_eq!(channel_names[0], "Dev1/ai0");
-            assert_eq!(channel_names[1], "Dev1/ai1");
+    #[ignore = "requires NI-DAQmx runtime and Dev1 with three analog inputs"]
+    fn continuous_three_channel_acquisition() {
+        let task = Task::new("").unwrap();
+        for i in 0..3 {
+            task.ai_channels
+                .add_ai_voltage_chan(&format!("Dev1/ai{i}"), -10., 10.)
+                .unwrap();
         }
-    }
-
-    #[test]
-    fn ai_channel_indexing() {
-        let task_name = "ai_channel_indexing";
-        {
-            let task = Task::new(task_name).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai0", -5.0, 5.0).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai1", -5.0, 5.0).unwrap();
-
-            let ai0 = task.ai_channels.channel_at(0).unwrap();
-            assert_eq!(ai0.name, "Dev1/ai0");
-            let ai1 = task.ai_channels.channel_at(1).unwrap();
-            assert_eq!(ai1.name, "Dev1/ai1");
+        task.timing
+            .cfg_samp_clk_timing(100_000., SampleMode::ContinuousSamps, 100_000)
+            .unwrap();
+        task.start().unwrap();
+        for _ in 0..3 {
+            assert_eq!(task.read_sync(10_000).unwrap().len(), 30_000);
         }
+        // Drop must release the running task without stop().
     }
-
-    #[test]
-    #[should_panic]
-    fn ai_invalid_channel_indexing() {
-        let task_name = "ai_invalid_channel_indexing";
-        {
-            let task = Task::new(task_name).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai0", -5.0, 5.0).unwrap();
-            task.ai_channels.add_ai_voltage_chan("Dev1/ai1", -5.0, 5.0).unwrap();
-            // index out of bounds should_panic, so match everything successfully
-            match task.ai_channels.channel_at(2) {
-                _ => ()
-            };
-        }
-    }
-
 }
